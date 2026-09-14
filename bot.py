@@ -12,7 +12,6 @@ import logging
 from datetime import datetime
 
 import qrcode
-from PIL import Image, ImageDraw, ImageFont
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
@@ -187,95 +186,26 @@ def stats():
 
 # ---------- КАРТИНКА КАРТЫ ----------
 
-def load_font(size, bold=False):
-    paths = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold
-        else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf",
-    ]
-    for p in paths:
-        try:
-            return ImageFont.truetype(p, size)
-        except Exception:
-            continue
-    return ImageFont.load_default()
-
-
-def make_card(card_id, name, visits):
-    """Рисует карту лояльности как картинку."""
-    level, discount = get_level(visits)
-
-    W, H = 900, 1300
-    bg = (28, 26, 24)
-    card_bg = (245, 242, 236)
-    accent = (176, 141, 87)
-
-    img = Image.new("RGB", (W, H), bg)
-    d = ImageDraw.Draw(img)
-
-    # Заголовок кофейни
-    f_logo = load_font(64, bold=True)
-    d.text((W // 2, 70), CAFE_NAME, font=f_logo, fill=card_bg, anchor="mt")
-    f_sub = load_font(24)
-    d.text((W // 2, 150), "C O F F E E", font=f_sub, fill=accent, anchor="mt")
-
-    # Белая карточка
-    cx, cy, cw, ch = 70, 220, W - 140, 820
-    d.rounded_rectangle([cx, cy, cx + cw, cy + ch], radius=40, fill=card_bg)
-
-    # Верхняя полоса уровня
-    d.rounded_rectangle([cx, cy + 90, cx + cw, cy + 260], radius=0, fill=accent)
-    f_level = load_font(42, bold=True)
-    d.text((cx + cw // 2, cy + 175), level, font=f_level, fill=card_bg, anchor="mm")
-
-    # Визиты сверху справа
-    f_small = load_font(22)
-    f_num = load_font(40, bold=True)
-    d.text((cx + cw - 40, cy + 25), "WIZITLER / ВИЗИТЫ", font=f_small, fill=(120, 115, 105), anchor="rt")
-    d.text((cx + cw - 40, cy + 55), str(visits), font=f_num, fill=(40, 38, 35), anchor="rt")
-
-    # Скидка и имя
-    d.text((cx + 40, cy + 300), "ARZANLAŞYK / СКИДКА", font=f_small, fill=(120, 115, 105))
-    d.text((cx + 40, cy + 335), f"{discount}%", font=f_num, fill=(40, 38, 35))
-
-    d.text((cx + cw - 40, cy + 300), "KART EÝESI / ГОСТЬ", font=f_small, fill=(120, 115, 105), anchor="rt")
-    f_name = load_font(32, bold=True)
-    d.text((cx + cw - 40, cy + 335), name[:20], font=f_name, fill=(40, 38, 35), anchor="rt")
-
-    # QR-код
-    qr = qrcode.QRCode(box_size=10, border=1)
-    qr.add_data(f"https://t.me/{BOT_USERNAME}?start=g{card_id}")
-    qr.make(fit=True)
-    qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
-    qr_size = 330
-    qr_img = qr_img.resize((qr_size, qr_size))
-    img.paste(qr_img, (cx + (cw - qr_size) // 2, cy + 430))
-
-    f_card = load_font(20)
-    d.text((cx + cw // 2, cy + 780), f"№ {card_id}", font=f_card,
-           fill=(120, 115, 105), anchor="mm")
-
-    # Подсказка про следующий уровень
-    nxt = next_level_info(visits)
-    f_hint = load_font(26)
-    if nxt:
-        need, nname, ndisc = nxt
-        hint = f"Ýene {need} wizit → {nname} ({ndisc}%)"
-        hint2 = f"Ещё {need} визитов до уровня {nname} — скидка {ndisc}%"
-    else:
-        hint = "Iň ýokary dereje!"
-        hint2 = "Максимальный уровень достигнут!"
-    d.text((W // 2, cy + ch + 50), hint, font=f_hint, fill=accent, anchor="mt")
-    d.text((W // 2, cy + ch + 95), hint2, font=f_hint, fill=(170, 165, 155), anchor="mt")
-
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    return buf.read()
+import card_design
 
 
 def render_card(tg_id, name, visits):
-    return make_card(tg_id, name, visits)
+    level, discount = get_level(visits)
+    nxt = next_level_info(visits)
+    next_info = None
+    if nxt:
+        need, nname, ndisc = nxt
+        prev = max([l[0] for l in LEVELS if l[0] <= visits] or [0])
+        total = (visits + need) - prev
+        next_info = (need, nname, ndisc, visits - prev, total)
+
+    qr = qrcode.QRCode(box_size=10, border=1)
+    qr.add_data(f"https://t.me/{BOT_USERNAME}?start=g{tg_id}")
+    qr.make(fit=True)
+    qr_img = qr.make_image(fill_color="black", back_color="white")
+
+    return card_design.render(tg_id, name, visits, level, discount,
+                              next_info, CAFE_NAME, qr_img)
 
 
 # ---------- КЛАВИАТУРЫ ----------
