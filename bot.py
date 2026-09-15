@@ -551,6 +551,23 @@ async def cmd_report(message: Message):
 
 # ---------- АДМИН ----------
 
+@dp.message(Command("reset"))
+async def cmd_reset(message: Message):
+    """Пройти регистрацию заново (имя и дата рождения). Визиты сохраняются."""
+    uid = message.from_user.id
+    g = get_guest(uid)
+    if not g:
+        await message.answer("Вы ещё не зарегистрированы. Отправьте /start")
+        return
+    update_guest(uid, reg_step=STEP_NAME)
+    await message.answer(
+        "Давайте заполним карту заново. Визиты сохранятся.\n\n"
+        "<b>Как вас зовут?</b>\nНапишите имя и фамилию.",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
 @dp.message(Command("id"))
 async def cmd_id(message: Message):
     await message.answer(f"Ваш ID: <code>{message.from_user.id}</code>", parse_mode="HTML")
@@ -576,7 +593,8 @@ async def cmd_admin(message: Message):
         "<code>/report</code> — таблица гостей в Excel\n"
         "<code>/addstaff ID Имя</code> — добавить кассира\n"
         "<code>/delstaff ID</code> — убрать кассира\n"
-        "<code>/id</code> — узнать свой Telegram ID",
+        "<code>/id</code> — узнать свой Telegram ID\n"
+        "<code>/reset</code> — заполнить свою карту заново",
         parse_mode="HTML")
 
 
