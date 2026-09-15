@@ -1,14 +1,16 @@
 # -*- coding: utf-8 -*-
 """
 Owaz Coffee — бот карты лояльности.
-Гость получает виртуальную карту с QR-кодом.
-Кассир сканирует QR телефоном и начисляет визит.
+Гость регистрируется (имя + дата рождения), получает карту с QR-кодом.
+Кассир сканирует QR или вводит номер карты и начисляет визит.
 """
 
 import os
 import io
+import re
 import sqlite3
 import logging
+import asyncio
 from datetime import datetime
 
 import qrcode
@@ -23,8 +25,10 @@ from aiogram.types import (
     InlineKeyboardButton,
     ReplyKeyboardMarkup,
     KeyboardButton,
+    ReplyKeyboardRemove,
 )
-import asyncio
+
+import card_design
 
 logging.basicConfig(level=logging.INFO)
 
@@ -42,23 +46,25 @@ DB_PATH = os.path.join(DB_DIR, "owaz_loyalty.db")
 
 # Уровни: (минимум визитов, название, скидка %)
 LEVELS = [
-    (100, "VIP OWAZ", 20),
-    (60, "ZAWSEGDATAÝ", 15),
-    (30, "HEMIŞELIK MYHMAN", 10),
-    (10, "OWAZ DOSTY", 5),
-    (0, "MYHMAN", 0),
+    (100, "VIP", 20),
+    (60, "ЗАВСЕГДАТАЙ", 15),
+    (30, "ПОСТОЯННЫЙ", 10),
+    (10, "ДРУГ", 5),
+    (0, "ГОСТЬ", 0),
 ]
+
+# Шаги регистрации
+STEP_DONE, STEP_NAME, STEP_BIRTH = 0, 1, 2
 
 
 def get_level(visits: int):
     for min_v, name, disc in LEVELS:
         if visits >= min_v:
             return name, disc
-    return "MYHMAN", 0
+    return "ГОСТЬ", 0
 
 
 def next_level_info(visits: int):
-    """Сколько визитов до следующего уровня."""
     ups = sorted([l for l in LEVELS if l[0] > visits], key=lambda x: x[0])
     if not ups:
         return None
@@ -102,6 +108,12 @@ def init_db():
             created_at TEXT
         )
     """)
+    # Новые колонки для уже существующих баз
+    have = {r["name"] for r in c.execute("PRAGMA table_info(guests)")}
+    if "birthday" not in have:
+        c.execute("ALTER TABLE guests ADD COLUMN birthday TEXT")
+    if "reg_step" not in have:
+        c.execute("ALTER TABLE guests ADD COLUMN reg_step INTEGER DEFAULT 0")
     conn.commit()
     conn.close()
 
@@ -113,28 +125,32 @@ def get_guest(tg_id):
     return row
 
 
-def create_guest(tg_id, name):
+def create_guest(tg_id):
     conn = db()
     conn.execute(
-        "INSERT OR IGNORE INTO guests (tg_id, name, visits, created_at) VALUES (?,?,0,?)",
-        (tg_id, name, datetime.now().isoformat()),
+        "INSERT OR IGNORE INTO guests (tg_id, name, visits, created_at, reg_step) "
+        "VALUES (?,?,0,?,?)",
+        (tg_id, "", datetime.now().isoformat(), STEP_NAME),
     )
     conn.commit()
     conn.close()
 
 
-def set_phone(tg_id, phone):
+def update_guest(tg_id, **fields):
+    if not fields:
+        return
+    sets = ", ".join(f"{k}=?" for k in fields)
     conn = db()
-    conn.execute("UPDATE guests SET phone=? WHERE tg_id=?", (phone, tg_id))
+    conn.execute(f"UPDATE guests SET {sets} WHERE tg_id=?",
+                 (*fields.values(), tg_id))
     conn.commit()
     conn.close()
 
 
 def change_visits(guest_id, staff_id, delta):
     conn = db()
-    conn.execute(
-        "UPDATE guests SET visits = MAX(0, visits + ?) WHERE tg_id=?", (delta, guest_id)
-    )
+    conn.execute("UPDATE guests SET visits = MAX(0, visits + ?) WHERE tg_id=?",
+                 (delta, guest_id))
     conn.execute(
         "INSERT INTO visits_log (guest_id, staff_id, change, created_at) VALUES (?,?,?,?)",
         (guest_id, staff_id, delta, datetime.now().isoformat()),
@@ -156,10 +172,8 @@ def is_staff(tg_id):
 
 def add_staff(tg_id, name):
     conn = db()
-    conn.execute(
-        "INSERT OR REPLACE INTO staff (tg_id, name, added_at) VALUES (?,?,?)",
-        (tg_id, name, datetime.now().isoformat()),
-    )
+    conn.execute("INSERT OR REPLACE INTO staff (tg_id, name, added_at) VALUES (?,?,?)",
+                 (tg_id, name, datetime.now().isoformat()))
     conn.commit()
     conn.close()
 
@@ -173,21 +187,17 @@ def remove_staff(tg_id):
 
 def stats():
     conn = db()
-    total = conn.execute("SELECT COUNT(*) c FROM guests").fetchone()["c"]
+    total = conn.execute("SELECT COUNT(*) c FROM guests WHERE reg_step=0").fetchone()["c"]
     visits = conn.execute("SELECT COALESCE(SUM(visits),0) s FROM guests").fetchone()["s"]
     today = datetime.now().strftime("%Y-%m-%d")
     today_v = conn.execute(
         "SELECT COUNT(*) c FROM visits_log WHERE change>0 AND created_at LIKE ?",
-        (today + "%",),
-    ).fetchone()["c"]
+        (today + "%",)).fetchone()["c"]
     conn.close()
     return total, visits, today_v
 
 
-# ---------- КАРТИНКА КАРТЫ ----------
-
-import card_design
-
+# ---------- КАРТА ----------
 
 def render_card(tg_id, name, visits):
     level, discount = get_level(visits)
@@ -221,20 +231,43 @@ def guest_kb():
 
 
 def staff_panel_kb(guest_id):
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Wizit goş / Начислить визит",
-                                  callback_data=f"add:{guest_id}")],
-            [InlineKeyboardButton(text="➖ Ýalňyşlyk / Отменить визит",
-                                  callback_data=f"sub:{guest_id}")],
-        ]
-    )
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Начислить визит", callback_data=f"add:{guest_id}")],
+        [InlineKeyboardButton(text="➖ Отменить визит", callback_data=f"sub:{guest_id}")],
+    ])
 
 
 # ---------- БОТ ----------
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
+
+async def show_guest_panel(message: Message, guest_id: int):
+    g = get_guest(guest_id)
+    if not g or g["reg_step"] != STEP_DONE:
+        await message.answer("Гость не найден. Проверьте номер карты.")
+        return
+    level, disc = get_level(g["visits"])
+    await message.answer(
+        f"👤 <b>{g['name']}</b>\n"
+        f"Визиты: <b>{g['visits']}</b>\n"
+        f"Уровень: <b>{level}</b>\n"
+        f"Скидка: <b>{disc}%</b>\n"
+        f"Карта: <code>{guest_id}</code>",
+        parse_mode="HTML",
+        reply_markup=staff_panel_kb(guest_id),
+    )
+
+
+async def send_card(message: Message, tg_id: int):
+    g = get_guest(tg_id)
+    png = render_card(tg_id, g["name"] or "Гость", g["visits"])
+    await message.answer_photo(
+        BufferedInputFile(png, filename="card.png"),
+        caption="👆 Покажите QR-код кассиру / QR kody kassira görkeziň",
+        reply_markup=guest_kb(),
+    )
 
 
 @dp.message(CommandStart())
@@ -246,105 +279,150 @@ async def cmd_start(message: Message):
     if payload.startswith("g") and payload[1:].isdigit():
         guest_id = int(payload[1:])
         if is_staff(message.from_user.id) and guest_id != message.from_user.id:
-            g = get_guest(guest_id)
-            if not g:
-                await message.answer("Myhman tapylmady / Гость не найден.")
-                return
-            level, disc = get_level(g["visits"])
-            await message.answer(
-                f"👤 <b>{g['name']}</b>\n"
-                f"Wizitler / Визиты: <b>{g['visits']}</b>\n"
-                f"Dereje / Уровень: <b>{level}</b>\n"
-                f"Arzanlaşyk / Скидка: <b>{disc}%</b>",
-                parse_mode="HTML",
-                reply_markup=staff_panel_kb(guest_id),
-            )
+            await show_guest_panel(message, guest_id)
             return
 
-    # Обычный гость
-    name = message.from_user.full_name or "Myhman"
-    create_guest(message.from_user.id, name)
+    g = get_guest(message.from_user.id)
+    if g and g["reg_step"] == STEP_DONE:
+        await send_card(message, message.from_user.id)
+        return
+
+    create_guest(message.from_user.id)
+    update_guest(message.from_user.id, reg_step=STEP_NAME)
     await message.answer(
-        f"Salam, {name}! 👋\n\n"
-        f"{CAFE_NAME} kofehanasynyň wepalylyk kartyna hoş geldiňiz.\n"
-        f"Добро пожаловать в клуб гостей {CAFE_NAME}!\n\n"
-        "Her gezek gelendeǹizde kassira QR kodyňyzy görkeziň — "
-        "wizit ýazylar we arzanlaşyk ýygnalar.\n"
-        "Показывайте QR-код кассиру при каждом визите — "
-        "визиты копятся, скидка растёт.",
-        reply_markup=guest_kb(),
-    )
-    await send_card(message.from_user.id, message)
-
-
-async def send_card(tg_id, message: Message):
-    g = get_guest(tg_id)
-    if not g:
-        create_guest(tg_id, message.from_user.full_name or "Myhman")
-        g = get_guest(tg_id)
-    png = render_card(tg_id, g["name"], g["visits"])
-    await message.answer_photo(
-        BufferedInputFile(png, filename="card.png"),
-        caption="👆 QR kody kassira görkeziň / Покажите QR-код кассиру",
+        f"Salam! 👋 Добро пожаловать в клуб гостей {CAFE_NAME}!\n\n"
+        "Чтобы оформить карту, ответьте на два вопроса.\n\n"
+        "<b>Как вас зовут?</b>\n"
+        "Напишите имя и фамилию.",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardRemove(),
     )
 
 
-@dp.message(F.text.contains("Моя карта") | F.text.contains("kartym"))
-async def my_card(message: Message):
-    await send_card(message.from_user.id, message)
+def parse_birthday(text):
+    """Принимает 01.02.1995, 01/02/1995, 1.2.95 и т.п."""
+    m = re.match(r"^\s*(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{2,4})\s*$", text)
+    if not m:
+        return None
+    d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    if y < 100:
+        y += 1900 if y > 30 else 2000
+    try:
+        dt = datetime(y, mo, d)
+    except ValueError:
+        return None
+    if dt.year < 1920 or dt > datetime.now():
+        return None
+    return dt.strftime("%Y-%m-%d")
 
 
-@dp.message(F.text.contains("Условия") | F.text.contains("Şertler"))
-async def rules(message: Message):
-    text = f"<b>{CAFE_NAME} — wepalylyk kartasy / карта лояльности</b>\n\n"
-    for min_v, name, disc in sorted(LEVELS, key=lambda x: x[0]):
-        if disc == 0:
-            text += f"• <b>{name}</b> — {min_v}+ wizit / визитов — ýygnaýarsyňyz\n"
-        else:
-            text += f"• <b>{name}</b> — {min_v}+ wizit / визитов — <b>{disc}%</b>\n"
-    text += ("\nBir gezek gelmek = 1 wizit.\nОдин визит = 1 отметка.\n"
-             "Arzanlaşyk awtomatiki işleýär.\nСкидка применяется автоматически.")
-    await message.answer(text, parse_mode="HTML")
+@dp.message(F.text, ~F.text.startswith("/"))
+async def on_text(message: Message):
+    uid = message.from_user.id
+    text = (message.text or "").strip()
+    g = get_guest(uid)
+
+    # --- Регистрация ---
+    if g and g["reg_step"] == STEP_NAME:
+        name = text[:40]
+        if len(name) < 2:
+            await message.answer("Слишком короткое имя. Напишите имя и фамилию.")
+            return
+        update_guest(uid, name=name, reg_step=STEP_BIRTH)
+        await message.answer(
+            f"Приятно познакомиться, {name}!\n\n"
+            "<b>Когда у вас день рождения?</b>\n"
+            "Напишите дату в формате ДД.ММ.ГГГГ — например 14.03.1995.\n"
+            "Мы дарим подарки именинникам 🎁",
+            parse_mode="HTML",
+        )
+        return
+
+    if g and g["reg_step"] == STEP_BIRTH:
+        bd = parse_birthday(text)
+        if not bd:
+            await message.answer(
+                "Не понял дату. Напишите в формате ДД.ММ.ГГГГ — например 14.03.1995."
+            )
+            return
+        update_guest(uid, birthday=bd, reg_step=STEP_DONE)
+        await message.answer(
+            "Готово! Ваша карта оформлена 🎉\n\n"
+            "Показывайте QR-код кассиру при каждом визите — "
+            "визиты копятся, скидка растёт.",
+            reply_markup=guest_kb(),
+        )
+        await send_card(message, uid)
+        return
+
+    # --- Кнопки гостя ---
+    if "Моя карта" in text or "kartym" in text:
+        if not g or g["reg_step"] != STEP_DONE:
+            await message.answer("Сначала завершите регистрацию: отправьте /start")
+            return
+        await send_card(message, uid)
+        return
+
+    if "Условия" in text or "Şertler" in text:
+        t = f"<b>{CAFE_NAME} — карта лояльности</b>\n\n"
+        for min_v, name, disc in sorted(LEVELS, key=lambda x: x[0]):
+            if disc == 0:
+                t += f"• <b>{name}</b> — от {min_v} визитов — копим\n"
+            else:
+                t += f"• <b>{name}</b> — от {min_v} визитов — скидка <b>{disc}%</b>\n"
+        t += ("\nОдин визит = 1 отметка.\nСкидка применяется автоматически.\n"
+              "В день рождения — подарок от кофейни 🎁")
+        await message.answer(t, parse_mode="HTML")
+        return
+
+    # --- Кассир ввёл номер карты ---
+    if is_staff(uid) and text.isdigit() and len(text) >= 5:
+        await show_guest_panel(message, int(text))
+        return
+
+    if is_staff(uid):
+        await message.answer(
+            "Отсканируйте QR гостя или отправьте номер карты (цифры под QR)."
+        )
 
 
 @dp.callback_query(F.data.startswith("add:"))
 async def cb_add(call: CallbackQuery):
     if not is_staff(call.from_user.id):
-        await call.answer("Rugsat ýok / Нет доступа", show_alert=True)
+        await call.answer("Нет доступа", show_alert=True)
         return
     guest_id = int(call.data.split(":")[1])
     old = get_guest(guest_id)
+    if not old:
+        await call.answer("Гость не найден", show_alert=True)
+        return
     old_level, _ = get_level(old["visits"])
     new_visits = change_visits(guest_id, call.from_user.id, +1)
     level, disc = get_level(new_visits)
 
     await call.message.edit_text(
-        f"✅ Wizit ýazyldy / Визит начислен\n\n"
+        f"✅ Визит начислен\n\n"
         f"👤 <b>{old['name']}</b>\n"
-        f"Wizitler / Визиты: <b>{new_visits}</b>\n"
-        f"Dereje / Уровень: <b>{level}</b>\n"
-        f"Arzanlaşyk / Скидка: <b>{disc}%</b>",
+        f"Визиты: <b>{new_visits}</b>\n"
+        f"Уровень: <b>{level}</b>\n"
+        f"Скидка: <b>{disc}%</b>",
         parse_mode="HTML",
         reply_markup=staff_panel_kb(guest_id),
     )
-    await call.answer("Wizit +1")
+    await call.answer("Визит +1")
 
-    # Уведомляем гостя
     try:
         if level != old_level:
             await bot.send_message(
                 guest_id,
-                f"🎉 Gutlaýarys! Täze dereje: <b>{level}</b>\n"
-                f"Поздравляем! Новый уровень: <b>{level}</b> — скидка <b>{disc}%</b>",
-                parse_mode="HTML",
-            )
+                f"🎉 Поздравляем! Новый уровень: <b>{level}</b>\n"
+                f"Ваша скидка теперь <b>{disc}%</b>",
+                parse_mode="HTML")
         else:
             await bot.send_message(
                 guest_id,
-                f"✅ Wizit ýazyldy / Визит засчитан.\n"
-                f"Jemi / Всего: <b>{new_visits}</b> · Arzanlaşyk / Скидка: <b>{disc}%</b>",
-                parse_mode="HTML",
-            )
+                f"✅ Визит засчитан.\nВсего: <b>{new_visits}</b> · Скидка: <b>{disc}%</b>",
+                parse_mode="HTML")
     except Exception as e:
         logging.warning(f"Не смог уведомить гостя: {e}")
 
@@ -352,29 +430,130 @@ async def cb_add(call: CallbackQuery):
 @dp.callback_query(F.data.startswith("sub:"))
 async def cb_sub(call: CallbackQuery):
     if not is_staff(call.from_user.id):
-        await call.answer("Rugsat ýok / Нет доступа", show_alert=True)
+        await call.answer("Нет доступа", show_alert=True)
         return
     guest_id = int(call.data.split(":")[1])
     g = get_guest(guest_id)
     new_visits = change_visits(guest_id, call.from_user.id, -1)
     level, disc = get_level(new_visits)
     await call.message.edit_text(
-        f"↩️ Wizit yzyna alyndy / Визит отменён\n\n"
+        f"↩️ Визит отменён\n\n"
         f"👤 <b>{g['name']}</b>\n"
-        f"Wizitler / Визиты: <b>{new_visits}</b>\n"
-        f"Dereje / Уровень: <b>{level}</b> · {disc}%",
+        f"Визиты: <b>{new_visits}</b>\n"
+        f"Уровень: <b>{level}</b> · {disc}%",
         parse_mode="HTML",
         reply_markup=staff_panel_kb(guest_id),
     )
-    await call.answer("Wizit -1")
+    await call.answer("Визит -1")
+
+
+# ---------- ОТЧЁТ В EXCEL ----------
+
+def build_report():
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    conn = db()
+    guests = conn.execute("""
+        SELECT g.tg_id, g.name, g.visits, g.birthday, g.created_at,
+               (SELECT MAX(created_at) FROM visits_log
+                 WHERE guest_id = g.tg_id AND change > 0) AS last_visit
+        FROM guests g WHERE g.reg_step = 0
+        ORDER BY g.visits DESC, g.name
+    """).fetchall()
+    logs = conn.execute("""
+        SELECT v.created_at, v.guest_id, g.name, v.change
+        FROM visits_log v LEFT JOIN guests g ON g.tg_id = v.guest_id
+        ORDER BY v.created_at DESC LIMIT 5000
+    """).fetchall()
+    conn.close()
+
+    head_font = Font(name="Arial", bold=True, color="FFFFFF")
+    head_fill = PatternFill("solid", fgColor="8A6D3B")
+    body_font = Font(name="Arial")
+
+    def ru_date(iso):
+        if not iso:
+            return "—"
+        try:
+            return datetime.strptime(iso[:10], "%Y-%m-%d").strftime("%d.%m.%Y")
+        except ValueError:
+            return iso[:10]
+
+    wb = Workbook()
+
+    ws = wb.active
+    ws.title = "Гости"
+    ws.append(["Имя гостя", "День рождения", "Визиты", "Уровень", "Скидка %",
+               "Регистрация", "Последний визит", "Номер карты"])
+    for g in guests:
+        level, disc = get_level(g["visits"])
+        ws.append([g["name"], ru_date(g["birthday"]), g["visits"], level, disc,
+                   ru_date(g["created_at"]),
+                   (g["last_visit"] or "—")[:16].replace("T", " "),
+                   g["tg_id"]])
+
+    ws2 = wb.create_sheet("Журнал визитов")
+    ws2.append(["Дата и время", "Гость", "Операция", "Номер карты"])
+    for r in logs:
+        ws2.append([(r["created_at"] or "")[:16].replace("T", " "),
+                    r["name"] or "—",
+                    "Визит +1" if r["change"] > 0 else "Отмена -1",
+                    r["guest_id"]])
+
+    ws3 = wb.create_sheet("Дни рождения")
+    ws3.append(["Дата", "Имя гостя", "Визиты", "Уровень"])
+    bdays = [g for g in guests if g["birthday"]]
+    bdays.sort(key=lambda g: g["birthday"][5:])
+    for g in bdays:
+        level, _ = get_level(g["visits"])
+        ws3.append([ru_date(g["birthday"])[:5], g["name"], g["visits"], level])
+
+    for sheet, widths in ((ws, [26, 14, 9, 16, 10, 14, 18, 14]),
+                          (ws2, [20, 26, 14, 14]),
+                          (ws3, [10, 26, 9, 16])):
+        for i, w in enumerate(widths, start=1):
+            sheet.column_dimensions[get_column_letter(i)].width = w
+        for cell in sheet[1]:
+            cell.font = head_font
+            cell.fill = head_fill
+            cell.alignment = Alignment(horizontal="center")
+        for row in sheet.iter_rows(min_row=2):
+            for cell in row:
+                cell.font = body_font
+        sheet.freeze_panes = "A2"
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.read()
+
+
+@dp.message(Command("report"))
+async def cmd_report(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        data = build_report()
+    except Exception as e:
+        logging.exception("Ошибка отчёта")
+        await message.answer(f"Не удалось собрать отчёт: {e}")
+        return
+    total, visits, today_v = stats()
+    stamp = datetime.now().strftime("%Y-%m-%d")
+    await message.answer_document(
+        BufferedInputFile(data, filename=f"owaz-guests-{stamp}.xlsx"),
+        caption=(f"📊 Отчёт на {stamp}\n"
+                 f"Гостей: {total} · Визитов всего: {visits} · Сегодня: {today_v}"),
+    )
 
 
 # ---------- АДМИН ----------
 
 @dp.message(Command("id"))
 async def cmd_id(message: Message):
-    await message.answer(f"Siziň ID / Ваш ID: <code>{message.from_user.id}</code>",
-                         parse_mode="HTML")
+    await message.answer(f"Ваш ID: <code>{message.from_user.id}</code>", parse_mode="HTML")
 
 
 @dp.message(Command("admin"))
@@ -385,19 +564,20 @@ async def cmd_admin(message: Message):
     conn = db()
     staff_rows = conn.execute("SELECT * FROM staff").fetchall()
     conn.close()
-    slist = "\n".join([f"• {s['name']} — <code>{s['tg_id']}</code>" for s in staff_rows]) or "— нет —"
+    slist = "\n".join(f"• {s['name']} — <code>{s['tg_id']}</code>"
+                      for s in staff_rows) or "— нет —"
     await message.answer(
-        f"<b>Панель администратора</b>\n\n"
-        f"Гостей всего: <b>{total}</b>\n"
+        "<b>Панель администратора</b>\n\n"
+        f"Гостей: <b>{total}</b>\n"
         f"Визитов всего: <b>{visits}</b>\n"
         f"Визитов сегодня: <b>{today_v}</b>\n\n"
         f"<b>Кассиры:</b>\n{slist}\n\n"
-        f"Команды:\n"
-        f"<code>/addstaff ID Имя</code> — добавить кассира\n"
-        f"<code>/delstaff ID</code> — убрать кассира\n"
-        f"<code>/id</code> — узнать свой Telegram ID",
-        parse_mode="HTML",
-    )
+        "Команды:\n"
+        "<code>/report</code> — таблица гостей в Excel\n"
+        "<code>/addstaff ID Имя</code> — добавить кассира\n"
+        "<code>/delstaff ID</code> — убрать кассира\n"
+        "<code>/id</code> — узнать свой Telegram ID",
+        parse_mode="HTML")
 
 
 @dp.message(Command("addstaff"))
@@ -408,7 +588,7 @@ async def cmd_addstaff(message: Message):
     if len(parts) < 2 or not parts[1].isdigit():
         await message.answer("Формат: /addstaff 123456789 Ислам")
         return
-    name = parts[2] if len(parts) > 2 else "Kassir"
+    name = parts[2] if len(parts) > 2 else "Кассир"
     add_staff(int(parts[1]), name)
     await message.answer(f"✅ Кассир {name} добавлен.")
 
